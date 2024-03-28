@@ -1,0 +1,437 @@
+%% MPC WIZARD
+%% Revision History
+%r01 published 8/9/2023
+%r02 published 8/14/2023
+%   allowed for a joint with one connection to be processed
+%r02.1 published 9/12/2023
+%   fixed matlen variable to always be # of rows of CBUSHmat
+%   script closes all files after filling out
+%   fixed code to write out all nodes including last by adding broken flag
+%% 
+clc;clear variables
+%It is known that all nodes belonging to a geometry will have ID#'s within
+%the same range; Assuming all of the joints(property ID's) represent a
+%connection between only two pieces of geometry; Then because ranges
+%defined for nodes belonging to different geometry are in ascending order,
+% and all joints are between nodes of separate pieces of geometry, and 
+% no node ID# repeats. When comparing nodes belonging to
+% 2 different pieces of geometry, all
+%nodes with IDs greater than the IDs of the nodes they are being compared
+%to must belong to the same geometry and all other nodes must then belong
+%to the other piece of geometry.
+%                                        .
+%                              /^\     .
+%                         /\   "V"
+%                        /__\   I      O  o
+%                       //..\\  I     .
+%                       \].`[/  I
+%                       /l\/j\  (]    .  O
+%                      /. ~~ ,\/I          .
+%                      \\L__j^\/I       o
+%                       \/--v}  I     o   .
+%                       |    |  I   _________
+%                       |    |  I c(`       ')o
+%                       |    l  I   \.     ,/      
+%                     _/j  L l\_!  _//^---^\\_
+%                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+% Trace Talbot / ATA
+%% DIALOG BOX INPUTS
+
+% %input box
+% prompt = {'[INPUT] File Path: ','[INPUT] File ID: ','[OUTPUT] MPC File Name: ','[OUTPUT] Reference Node File Name: ','First # in range assigned to refrence node IDs '};
+% dlgtitle = 'MPC Wizard';
+% dims = [1 80];
+% definput = {'D:\MyFilePath\MPCWizardPack','My_Model.dat','My_MPC_file_name','My_Ref_Node_name','0'};
+% answer = inputdlg(prompt,dlgtitle,dims,definput)
+%% USER INPUTS
+%//// ALL entries to answers must be strings ////
+answer{1} = 'C:\Users\ttalbot\Desktop\MPC_DEBUG';%file path ex: 'D:\MPC_WIZARD\MatLab\'
+answer{2} = 'RWAs_Upd_R04.blk';%file ID ex:'AssemblyLevelEntities_r03.blk'
+answer{3} = 'errorMPC2';%MPC File Name (no file extension required)
+answer{4} = 'errornode2';%Reference Node File Name (no file extension required)
+answer{5} = '0';%First # in range assigned to refrence node IDs
+csysflag = 1; %User turn csys flag to 1 if you want to have storage nodes associated with csys defining joint
+cSYSPIDfile ='C:\Users\ttalbot\Desktop\MPC_DEBUG\cSYSPIDfile.blk';%user input blk file path, written with two cols. In the first 8 spaces, there should be written the PID. In the second 8 spaces, there should be written the cSystem associated with the joint
+%note for cSYSPIDmat, no two csystems may be the same or script will fatal
+%% File editing
+%MPC Wizard takes in any dat or blk file and corresponding file path as a string 
+%ex:
+% sFilePath = 'D:\EMA\MPC_WIZARD\MatLab\';%file path for user input\
+% sFile = 'AssemblyLevelEntities_r03.blk';%working file 
+sFilePath=[answer{1},'\'];
+sFile=answer{2};
+ref_node_ID = str2num(answer{5})-1; %for user input, creates a node at ONE LESS then the first number of refnode range
+              % ex; if range = 1-10, then ref_node_ID should be set to 0,
+              % i.e., 1 less than zero
+
+%% OUTPUTS
+%User Enters names of files mpc equations and refNode gridpoints will be written to
+%ex:
+%MPCfile = fopen('mpc_equ_wizard_v01.dat','w');
+mpc = [answer{3},'.dat'];
+ref = [answer{4},'.blk'];
+MPCfile = fopen(mpc,'w');
+refnodeFile = fopen(ref,'w');
+
+%% Notes
+%
+% All blk and dat files must have 8 spaced margins
+%
+% \\cv-fs1\u\projects\72XXX\72349_LASP_MAX\05_Analysis\FEM_Labels_04.xlsx 
+% node id range describes different geometry
+% property id describes different joint
+%
+%grid formating
+% 12345678    123456781234567812345678123456781234567812345678
+% GRID    %s%s       0      0.      0.      0.       0
+%% File Organization Wizard
+%FOW takes in any dat or blk file, and outputs a CBUSHmat and PBUSHmat
+%PBUSH row counter(PRC) to 0
+%CBUSH row counter(CRC) to 0
+%
+% where every ele on cell array is a PBUSH vec
+%[propid 1 2 3] where 1 2 3 are stiffness in 1 2 3 directions 
+%
+%Preallocate CBUSHmat of row of zeros
+%[CBushID EID PID GA GB]
+%
+%for every line in dat file
+%   if first char pbush
+%   increase PRC by 1
+%   add PID to PRCth row of pvector
+%   create line_position vec [24 32 40]
+%   for all directions [1 2 3] (k)
+%      if check for sci notation true
+%         set minor = string of the minor
+%         set array = minor split
+%         convert 1 and two ele of array to numbers
+%         set (PRCth,K+1th) ele of p vec to (first ele of array * second ele of
+%         array)
+%      end
+%      if check for sci notation false
+%         make chars of position k+1 to k+8 to a number
+%         set (PRCth,K+1th) ele of p vec to (first ele of array * second ele of
+%         array)
+%      end
+%   if first char cbsuh
+%      increase CRC by one
+%      add a row of 6 zeros
+%      set third col to CBUSHid number
+%      set fourth col to node a number
+%      set fith col to node b number
+%   end
+%end
+file = importdata([sFilePath,sFile],'');%setting cell array to file
+dDim = size(file); % extract dimensions
+iNlines = dDim(1); % find the number of lines
+
+PRC = 0;%number of PBUSH elements in file
+CRC = 0;%number of CBUSH elements in file
+line_position = [24 32 40];%PBUSH stiffness char positions in line
+CBUSHmat = zeros(1,6);%Pre-allocating CBUSHmat
+var = 1;
+for R = 1:iNlines%for all lines in the file
+    line = file{R};%set var(line) to the string of chars in the Rth line of the file
+    lineSize = size(file{R});%measures number of characters in line of file
+    if lineSize(1,2) >= 5
+        if strcmp(line(1:5),'PBUSH')%if the first 5 chars of the line are, inorder PBUSH
+            PRC = PRC + 1;%increase the PBUSHvec array by one
+            Pbush_vector = zeros(1,4);%resetting PBUSH vec
+            Pbush_vector(1,1) = str2num(line(9:16));%sets first ele of pvec to the PID of the PBUSH
+            for k = 1:3%for all 3 directions of stiffness
+                if contains(line(line_position(k)+1:line_position(k)+8),"+") == 1%if the chars in the kth direction contains a "+" sign
+                    direction_var = line(line_position(k)+1:line_position(k)+8);%set a var to the string
+                    direction_var_array = split(direction_var,"+");%splits the string of numbers at the + sign
+                    %converts str elements of array to numbers 
+                    direction_var_array{1} = str2num(direction_var_array{1});
+                    direction_var_array{2} = str2num(direction_var_array{2});
+                    %multiply two ele of array st array(1)*10^array(2)
+                    stiffness = direction_var_array{1}*10^direction_var_array{2};
+                    %sets k+1th ele of Pbush_vec to stiffness
+                    Pbush_vector(1,k+1) = stiffness;
+                else %if contains == 0, implies no sic not
+                    stiffness = str2num(line(line_position(k)+1:line_position(k)+8));%sets stiffness = to number
+                    Pbush_vector(1,k+1) = stiffness;%sets k+1th ele of Pbush_vec to stiffness
+                end
+            end
+            PBUSHvec{PRC} = Pbush_vector;
+     
+        elseif strcmp(line(1:5),'CBUSH')
+            CRC = CRC + 1;
+            CBUSHmat(CRC,:) = 0;%creating new CBUSH row
+            CBUSHmat(CRC,3) = str2num(line(17:24));%turning PID chars to numbers
+            CBUSHmat(CRC,4) = str2num(line(25:32));%turning node a char to number
+            CBUSHmat(CRC,5) = str2num(line(33:40));%turning node a char to number
+        end
+    else
+        var =1;
+    end
+end
+% below converts cSYSPIDfile to a mat(cSYSPIDmat) in form
+ %[PID1, PID2,..., PIDn]
+ %[SYS1, SYS2,..., SYSn]
+if csysflag == 1 %if user has turned on csysflag
+    file1 = importdata(cSYSPIDfile,'');%setting cell array to file
+    dDim1 = size(file); % extract dimensions
+    iNlines1 = dDim1(1); % find the number of lines
+
+%for every row of cSYSPIDfile
+
+%set iNlines1th col, first row of cSYSPIDmat to 
+%% Node Grouping Wizard
+% NodeGrouping Wizard begins with matrix composed of all Cbush elements as defined bellow
+%let cbushmat be nX4 mat w/ cols [CBushID EID PID GA GB]
+%CBushID = cbush ID
+%EID = element ID
+%PID = property ID
+%GA = A node
+%GB = B node
+%
+% Code then creates JOINTvec, a vector where every element is 
+% a matrix representing a joint. Each joint will contain
+% a Groupvec[1X3]. The first element = property id, 
+% second element of Groupvec = node with smaller PID,
+% and the third element = node with larger PID
+%
+% Code then sorts nodes with following information
+% *in rambling logic form*:
+%
+%It is known that all nodes belonging to a geometry will have ID#'s within
+%the same range; Assuming all of the joints(property ID's) represent a
+%connection between only two pices of geometry; Then becuase ranges
+%defined for nodes belonging to different geometry are in assending order,
+% and all joints are between nodes of seperate peices of geometry, and 
+% no node ID# repeats. When comparing nodes belonging to
+% 2 different pieces of geometry, all
+%nodes with IDs greater than the IDs of the nodes they are being compared
+%to must belong to the same geometry and all other nodes must then belong
+%to the other piece of geometry.
+sizemat = size(CBUSHmat);Cmatlen = sizemat(1,1);%Cmatlen = # of rows in CBUSHmat
+%define amount of properties in CBUSHmat
+PropCounter = 1;
+for i = 2:Cmatlen
+    if CBUSHmat(i,3) ~= CBUSHmat(i-1,3)
+        PropCounter = PropCounter + 1;
+    end
+end
+
+%counters
+k=0;%(Position along JOINTvec)
+r=2;%(second row of CBUSHmat)
+sGr=1;%(subGroup row)
+
+if CBUSHmat(1,4)<CBUSHmat(1,5)
+    %subGroup = [PID, smaller value node,larger value node]
+    subgroup(1,1) = CBUSHmat(1,3);subgroup(1,2) = CBUSHmat(1,4);subgroup(1,3) = CBUSHmat(1,5);
+else 
+     subgroup(1,1) = CBUSHmat(1,3);subgroup(1,2) = CBUSHmat(1,5);subgroup(1,3) = CBUSHmat(1,4);
+end
+
+while k<=PropCounter%for every element of JOINTvec
+    if CBUSHmat(r,3) == CBUSHmat(r-1,3) %if the previous PID = the rth PID
+        sGr = sGr + 1;%add one to the subgroup row count 
+        if CBUSHmat(r,4)<CBUSHmat(r,5)
+            subgroup(sGr,1) = CBUSHmat(r,3);
+            subgroup(sGr,2) = CBUSHmat(r,4);
+            subgroup(sGr,3) = CBUSHmat(r,5);
+            r = r+1; %increases r to next row of matrix
+            if r>Cmatlen
+                broken = 1;%turns broken flag on
+                break
+            end
+        else
+            subgroup(sGr,1) = CBUSHmat(r,3);
+            subgroup(sGr,2) = CBUSHmat(r,5);
+            subgroup(sGr,3) = CBUSHmat(r,4);
+            r = r+1; %increases r to next row of matrix
+            if r>Cmatlen
+                broken = 1;%turns broken flag on
+                break
+            end
+        end
+    else
+        k = k+1;
+        JOINTvec{k} = subgroup;%sets kth col of JOINTvec to subgroup
+        clearvars subgroup%deletes subgroup 
+        sGr = 1;
+        if CBUSHmat(r,4)<CBUSHmat(r,5)
+            subgroup(sGr,1) = CBUSHmat(r,3);
+            subgroup(sGr,2) = CBUSHmat(r,4);
+            subgroup(sGr,3) = CBUSHmat(r,5);
+            r = r+1; %increases r to next row of matrix
+            if r>Cmatlen
+                broken = 1;%turns broken flag on
+                break
+            end
+        else 
+            subgroup(sGr,1) = CBUSHmat(r,3);
+            subgroup(sGr,2) = CBUSHmat(r,5);
+            subgroup(sGr,3) = CBUSHmat(r,4);
+            r = r+1; %increases r to next row of matrix
+            if r>Cmatlen
+                broken = 1;%turns broken flag on
+                break
+            end
+        end
+        
+    end
+end
+%in the case that there is only one joint in model, 
+if k==0
+    JOINTvec{1} = subgroup;
+end
+%in the case that broken flag is on,indicating while loop has broken before last element of jointvec coul be filled
+if broken == 1
+    JOINTvec{k+1} = subgroup;
+    broken = 0;
+end
+
+%% MPC Equation Writing Wizard
+%MPC EQUATION writing WIZARD takes JOINTvec,and PBUSHvec
+%create ref node range var
+%set ref node counter to zero
+%create ref node starting at -1 of beggening of refnode range (-1 for
+%itteration)
+%create ref_node_vec with two rows and n cols, [ref node id ...]
+%                                              [joint prop id .]
+%    For every joint
+%      increase refnode counter by one
+%      create refnode element
+%      add element to first row of joint'th position of ref_node_vec
+%      add joint prop id to second row of joint'th position of ref_node_vec
+%      read property id to find stiffness 1 2 3
+%      put stiffness into stiffness vector
+%      set joint row counter(rc) to 0
+%         %makes node_id_vector for mat.dof{2}
+%         for first and second cols of joint element 
+%            for every row
+%               add 1 to joint row counter(rc)
+%               add node id to rcth place in node_id_vector (nodeid for mat)
+%            end
+%         end
+%         %makes ones_vector for mat.matrix
+%         for all of the rows counted (making ones vec for mat)
+%            if rows counted <=rc/2 make +1's
+%            if rows counted >rc/2 make -1's
+%         end
+%         %calling mpc writer
+%         for all 3 degrees of freedom (i)
+%            create mat.matrix with ith -(PBUSH property)*ones_vector
+%            mat.dof{1} for ref node with ith deg(i)
+%            mat.dof{2} for node_id_vector with deg(i)
+%            writempc *guessing that mpc always goes to the bottom of the
+%            file
+%         end
+%    end
+ref_node_counter = 0;
+%create ref_node_vec with two rows and n cols, 
+% [ref node id ...]
+% [joint prop id .]
+ref_node_vec = zeros(2,1); 
+PBUSHlen = length(PBUSHvec);
+
+for k = 1:length(JOINTvec)%for all joints in joint vec
+    ref_node_counter = ref_node_counter + 1; %increase rnc by one(used to change refnode id for every new joint)
+    ref_node_ID = ref_node_ID + 1;%increases nodes in range
+    ref_node_vec(1,k) = ref_node_ID; jointID = JOINTvec{k};ref_node_vec(2,k) = jointID(1,1);
+    %puts reff node id in first row and prop id into second row of the rnv
+    %read PBUSHvec and find matching property
+    for p = 1:PBUSHlen
+        PBUSHi = PBUSHvec{p};%extracts pth element of PBUSHvec
+        if PBUSHi(1,1) == ref_node_vec(2,k)%if the first ele(PID) of PBUSHi is == PID used by joint
+            stiffness = PBUSHvec{p};%extracting vector from PBUSH array
+            break
+        end
+    end
+    jrc = 0;%joint row counter
+    jointmat = JOINTvec{k};%extracting mat from current cell of JOINTvec
+    %make node_id_vec for mat.dof{2}
+    for j = 2:3%2 and 3 cols of joint element [PID nodeA nodeB]
+        for i = 1:length(jointmat(:,1))%for all the rows in the first col
+            jrc = jrc+1;
+            %add node id to jrcth place in node_id_vector
+            node_ID_vec(1,jrc) = jointmat(i,j);% 
+        end
+    end
+    %makes ones_vector for mat.matrix
+    for i = 1:jrc%for all of the rows counted
+        if i <= jrc/2%for the first half of the nodes (node A)
+            ones_vec(1,i) = 1;%ith ele of ones vec will have positive 1's
+        end
+        if i > jrc/2%for the second half of the nodes (node B)
+            ones_vec(1,i) = -1;% ith ele of ones vec
+        end
+    end
+
+    %calling mpc writer
+    for i =1:3%for every degree of freedom (i)
+        mat.matrix = -1*stiffness(i+1)*ones_vec;%stiffness in ith direction * vec of releative positions of nodes
+        mat.dof{1} = nd2ctrace(ref_node_vec(1,k),i);%ref node id from ref_node_vec, first row(id row) and kth col(1 ref node per joint)
+        mat.dof{2} = nd2ctrace(node_ID_vec,i);%node ids for the joint in the ith direction
+        writempc(mat,MPCfile,'row','silent','noprogbar');%writes mpc equation for ith direction
+    end
+    ones_vec(1,:) = 0;%resetting ones vec
+end
+fclose(MPCfile);
+%% Ref Node blk Wizard
+%[ref node id ...] RNM
+%[joint prop id .]
+space=[" ","  ","   ","    ","     ","      ","       ",""];
+format = '$* Joint Property ID: %s \nGRID    %s%s       0      0.      0.      0.       0\n';%csys turned off
+format1 = '$* Joint Property ID: %s \nGRID    %s%s       0      0.      0.      0.%s%s\n';%csys turned on
+%if csys flag is turned on
+%section creates matchmat, in format below, that associates csystems with
+%PIDS, in the same order as PIDS in the ref_node_mat
+if csysflag == 1
+        %match mat in format 
+    %[PID1, PID2,..., PIDn]
+    %[SYS1, SYS2,..., SYSn]
+    
+    %for all places of match mat, m
+    %   for all places of Bmat, b
+    %      if bth element of Bmat matches mth element of A mat
+    %         set first row of match mat, to second row, mth col, element of
+    %         Amat
+    %         break
+    %      
+    
+    %matchmat organizer
+    szA = size(ref_node_vec);colsA = szA(2);%sets scaler(colsA) to #cols of A
+    matchmat = zeros(2,colsA);%creates matchmat, same size as Amat in form below
+    %[PID1, PID2,..., PIDn]
+    %[SYS1, SYS2,..., SYSn]
+    for m = 1:colsA%for every col of matchmat
+        for b = 1:colsA%for every col of bmat,cycles through bmat
+            if cSYSPIDmat(2,b) == ref_node_vec(2,m)%when one of the b elements is the same as the element in the mth position of the Amat
+                matchmat(1,m) = ref_node_vec(2,m); %sets mth col of first row of matchmat to mth ele(pid) of Amat
+                matchmat(2,m) = cSYSPIDmat(1,m); %sets mth col of second ro of matchmat to mth ele(csys) of Bmat
+            end
+        end
+    end
+end
+for i =1:length(ref_node_vec(1,:))%for every ref nod ID
+    propIDstr = num2str(ref_node_vec(2,i));%PropID string of second row, ith col
+    nodeIDstr = num2str(ref_node_vec(1,i));%NodeID string of first row, ith col
+    blspc = 8-length(nodeIDstr);%blank spaces in node ID col
+    if blspc == 0
+        pos = 8;
+    else
+        pos = blspc;
+    end
+    if csysflag == 1
+        cSYSstr = num2str(matchmat(2,i));%converts ith(correspondign) element of matchmat to string to be printed 
+        %calculate spacing so csys is properly formatted
+        blspc1 = 8-length(cSYSstr);%blank spaces in cSYSstr(csystem string)
+        if blspc1 == 0
+            pos1 = 8;
+        else
+            pos1 = blspc1;
+        end
+        fprintf(refnodeFile,format1,propIDstr,space(pos),nodeIDstr,space(pos1),cSYSstr)%produce new format with proper spacing and matching csys
+    else
+        fprintf(refnodeFile,format,propIDstr,space(pos),nodeIDstr)
+    end
+end
+fclose(refnodeFile);
+disp("Your equations have been brewed")
+fclose('all');
